@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>f1tenth_stack</name>
+  <version>0.0.1</version>
+  <description>Onboard drivers and launch files for TT-02 autonomous RC car.</description>
+  <maintainer email="yoshi@todo.todo">yoshi</maintainer>
+  <license>MIT</license>
+
+  <depend>ackermann_msgs</depend>
+  <depend>ackermann_mux</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>pigpio_pwm_driver</depend>
+  <depend>sllidar_ros2</depend>
+  <depend>encoder_odometry</depend>
+  <depend>wall_follow</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
