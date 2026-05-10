@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-Follow the Gap Node
-  - ギャップ検出 (FTG)
-  - Pure Pursuit ステアリング制御
-  - 速度 PID（Ziegler-Nichols オーバーシュートなし）
+Follow the Gap Node v4
+  np.roll(n//2) で物理前方をindex中央に配置
+  angles[center]=0=前方、正=左、負=右
 """
-
 import math
 import numpy as np
 import rclpy
@@ -14,253 +12,349 @@ from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 from ackermann_msgs.msg import AckermannDriveStamped
 from std_srvs.srv import SetBool
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
 
 
 class PIDController:
-    """ZN法（オーバーシュートなし）速度PIDコントローラ"""
-
     def __init__(self, kp, ki, kd, out_min, out_max):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.out_min = out_min
-        self.out_max = out_max
-        self._integral = 0.0
-        self._prev_error = 0.0
+        self.kp=kp; self.ki=ki; self.kd=kd
+        self.out_min=out_min; self.out_max=out_max
+        self._integral=0.0; self._prev_error=0.0
 
     def reset(self):
-        self._integral = 0.0
-        self._prev_error = 0.0
+        self._integral=0.0; self._prev_error=0.0
 
     def compute(self, error, dt):
-        if dt <= 0.0:
-            return 0.0
-        self._integral += error * dt
-        derivative = (error - self._prev_error) / dt
+        if dt<=0.0: return 0.0
+        self._integral += error*dt
+        d = (error-self._prev_error)/dt
         self._prev_error = error
-        output = self.kp * error + self.ki * self._integral + self.kd * derivative
-        return float(np.clip(output, self.out_min, self.out_max))
+        return float(np.clip(
+            self.kp*error + self.ki*self._integral + self.kd*d,
+            self.out_min, self.out_max))
 
 
 class FollowTheGapNode(Node):
 
     def __init__(self):
         super().__init__('follow_the_gap_node')
-
-        # ── パラメータ宣言 ──────────────────────────────
-        self.declare_parameter('wheelbase',          0.257)
-        self.declare_parameter('bubble_radius',      0.3)
-        self.declare_parameter('scan_range_min',     0.1)
-        self.declare_parameter('scan_range_max',     3.5)
-        self.declare_parameter('scan_angle_min',    -2.35)
-        self.declare_parameter('scan_angle_max',     2.35)
-        self.declare_parameter('k_lookahead',        0.5)
-        self.declare_parameter('lookahead_min',      0.3)
-        self.declare_parameter('lookahead_max',      2.0)
-        self.declare_parameter('max_steering_angle', 0.4)
-        self.declare_parameter('speed_target',       1.0)
-        self.declare_parameter('speed_min',          0.3)
-        self.declare_parameter('zn_ku',              2.0)
-        self.declare_parameter('zn_tu',              0.5)
-        self.declare_parameter('pid_output_max',     3.0)
-        self.declare_parameter('pid_output_min',     0.0)
-
+        self.declare_parameter('wheelbase',             0.257)
+        self.declare_parameter('bubble_radius',         0.3)
+        self.declare_parameter('scan_range_min',        0.1)
+        self.declare_parameter('scan_range_max',        3.5)
+        self.declare_parameter('front_angle_width',     2.35)   # 有効範囲 前方±[rad]
+        self.declare_parameter('emergency_angle_width', 0.52)   # 緊急停止±[rad]
+        self.declare_parameter('k_lookahead',           0.5)
+        self.declare_parameter('lookahead_min',         0.3)
+        self.declare_parameter('lookahead_max',         2.0)
+        self.declare_parameter('max_steering_angle',    0.4)
+        self.declare_parameter('speed_target',          0.6)
+        self.declare_parameter('speed_min',             0.3)
+        self.declare_parameter('use_speed_pid',         False)
+        self.declare_parameter('front_stop_distance',   0.30)
+        self.declare_parameter('max_target_angle',       0.61)  # alpha上限[rad] ≈±35°
+        self.declare_parameter('steer_sign',            1)      # 符号反転用: +1 or -1
+        self.declare_parameter('zn_ku',                 2.0)
+        self.declare_parameter('zn_tu',                 0.5)
+        self.declare_parameter('pid_output_max',        1.0)
+        self.declare_parameter('pid_output_min',        0.0)
         self._load_params()
-
-        # ── 状態変数 ──────────────────────────────────
-        self._enabled    = False
-        self._v_current  = 0.0
-        self._prev_stamp = None
-
-        # ── PID 初期化 ────────────────────────────────
         self._init_pid()
+        self._enabled=False; self._v_current=0.0; self._prev_stamp=None
+        self._steer_ema=0.0  # EMAスムージング用
 
-        # ── Pub / Sub / Service ───────────────────────
-        self._drive_pub = self.create_publisher(
-            AckermannDriveStamped, 'drive', 10)
-
-        self._scan_sub = self.create_subscription(
-            LaserScan, 'scan', self._scan_callback, 10)
-
-        self._odom_sub = self.create_subscription(
-            Odometry, 'odom', self._odom_callback, 10)
-
-        self._enable_srv = self.create_service(
-            SetBool, '~/enable', self._enable_callback)
-
+        self._drive_pub  = self.create_publisher(AckermannDriveStamped,'drive',10)
+        self._marker_pub = self.create_publisher(MarkerArray, '/ftg_markers', 10)
+        self._scan_sub   = self.create_subscription(LaserScan,'scan',self._scan_callback,10)
+        self._odom_sub   = self.create_subscription(Odometry,'odom',self._odom_callback,10)
+        self._enable_srv = self.create_service(SetBool,'~/enable',self._enable_callback)
         self.get_logger().info(
-            f'follow_the_gap_node 起動完了 '
-            f'[Kp={self._pid.kp:.4f} Ki={self._pid.ki:.4f} Kd={self._pid.kd:.4f}]'
-        )
-        self.get_logger().info('enable サービスで走行開始: ros2 service call ~/enable std_srvs/srv/SetBool "{data: true}"')
+            f'follow_the_gap_node v4 起動完了 '
+            f'speed={self._speed_target} '
+            f'steer_sign={self._steer_sign} '
+            f'front=±{math.degrees(self._front_angle_width):.0f}deg')
+        self.get_logger().info(
+            'enable: ros2 service call /follow_the_gap_node/enable '
+            'std_srvs/srv/SetBool "{data: true}"')
 
-    # ──────────────────────────────────────────────────
     def _load_params(self):
-        self._wheelbase          = self.get_parameter('wheelbase').value
-        self._bubble_radius      = self.get_parameter('bubble_radius').value
-        self._scan_range_min     = self.get_parameter('scan_range_min').value
-        self._scan_range_max     = self.get_parameter('scan_range_max').value
-        self._scan_angle_min     = self.get_parameter('scan_angle_min').value
-        self._scan_angle_max     = self.get_parameter('scan_angle_max').value
-        self._k_lookahead        = self.get_parameter('k_lookahead').value
-        self._lookahead_min      = self.get_parameter('lookahead_min').value
-        self._lookahead_max      = self.get_parameter('lookahead_max').value
-        self._max_steer          = self.get_parameter('max_steering_angle').value
-        self._speed_target       = self.get_parameter('speed_target').value
-        self._speed_min          = self.get_parameter('speed_min').value
-        self._zn_ku              = self.get_parameter('zn_ku').value
-        self._zn_tu              = self.get_parameter('zn_tu').value
-        self._pid_out_max        = self.get_parameter('pid_output_max').value
-        self._pid_out_min        = self.get_parameter('pid_output_min').value
+        self._wheelbase        = self.get_parameter('wheelbase').value
+        self._bubble_radius    = self.get_parameter('bubble_radius').value
+        self._scan_range_min   = self.get_parameter('scan_range_min').value
+        self._scan_range_max   = self.get_parameter('scan_range_max').value
+        self._front_angle_width= self.get_parameter('front_angle_width').value
+        self._emg_angle_width  = self.get_parameter('emergency_angle_width').value
+        self._k_lookahead      = self.get_parameter('k_lookahead').value
+        self._lookahead_min    = self.get_parameter('lookahead_min').value
+        self._lookahead_max    = self.get_parameter('lookahead_max').value
+        self._max_steer        = self.get_parameter('max_steering_angle').value
+        self._speed_target     = self.get_parameter('speed_target').value
+        self._speed_min        = self.get_parameter('speed_min').value
+        self._use_speed_pid    = self.get_parameter('use_speed_pid').value
+        self._front_stop_dist  = self.get_parameter('front_stop_distance').value
+        self._max_target_angle = self.get_parameter('max_target_angle').value
+        self._steer_sign       = self.get_parameter('steer_sign').value
+        self._zn_ku            = self.get_parameter('zn_ku').value
+        self._zn_tu            = self.get_parameter('zn_tu').value
+        self._pid_out_max      = self.get_parameter('pid_output_max').value
+        self._pid_out_min      = self.get_parameter('pid_output_min').value
 
     def _init_pid(self):
-        """ZN法（オーバーシュートなし）でPIDゲインを自動計算"""
-        ku = self._zn_ku
-        tu = self._zn_tu
-        kp = 0.20 * ku
-        ki = 0.40 * ku / tu
-        kd = 0.066 * ku * tu
-        self._pid = PIDController(kp, ki, kd, self._pid_out_min, self._pid_out_max)
+        ku=self._zn_ku; tu=self._zn_tu
+        kp=0.20*ku; ki=0.40*ku/tu; kd=0.066*ku*tu
+        self._pid=PIDController(kp,ki,kd,self._pid_out_min,self._pid_out_max)
         self.get_logger().info(
-            f'ZN法ゲイン計算: Ku={ku} Tu={tu} → Kp={kp:.4f} Ki={ki:.4f} Kd={kd:.4f}')
+            f'ZN法ゲイン: Ku={ku} Tu={tu} → '
+            f'Kp={kp:.4f} Ki={ki:.4f} Kd={kd:.4f}')
 
-    # ──────────────────────────────────────────────────
-    def _enable_callback(self, request, response):
-        self._enabled = request.data
+    def _enable_callback(self, req, res):
+        self._enabled=req.data
         if self._enabled:
             self._pid.reset()
+            self._steer_ema=0.0
             self.get_logger().info('★ FTG 走行 開始')
         else:
             self._publish_stop()
             self.get_logger().info('■ FTG 走行 停止')
-        response.success = True
-        response.message = 'enabled' if self._enabled else 'disabled'
-        return response
+        res.success=True; res.message='enabled' if self._enabled else 'disabled'
+        return res
 
-    def _odom_callback(self, msg: Odometry):
+    def _odom_callback(self, msg):
         self._v_current = msg.twist.twist.linear.x
 
-    # ──────────────────────────────────────────────────
     def _scan_callback(self, msg: LaserScan):
         if not self._enabled:
             return
 
-        # dt 計算
         now = self.get_clock().now().nanoseconds * 1e-9
-        dt = (now - self._prev_stamp) if self._prev_stamp is not None else 0.033
+        dt  = (now-self._prev_stamp) if self._prev_stamp is not None else 0.033
         self._prev_stamp = now
-        dt = max(dt, 1e-4)
+        dt  = max(dt, 1e-4)
 
-        # ── Step 1: 前処理 ────────────────────────────
-        ranges = np.array(msg.ranges, dtype=np.float32)
-        angle_min  = msg.angle_min
+        # ── Step 1: 前処理 + 配列ロール ─────────────────────────
+        ranges_raw = np.array(msg.ranges, dtype=np.float32)
         angle_inc  = msg.angle_increment
-        n          = len(ranges)
-        angles     = angle_min + np.arange(n) * angle_inc
+        n          = len(ranges_raw)
 
-        # 有効角度範囲マスク
-        angle_mask = (angles >= self._scan_angle_min) & (angles <= self._scan_angle_max)
+        # inf/nan → max に置換、範囲クリップ
+        ranges_raw = np.where(np.isfinite(ranges_raw), ranges_raw, self._scan_range_max)
+        ranges_raw = np.clip(ranges_raw, self._scan_range_min, self._scan_range_max)
 
-        # inf / nan / 範囲外 を scan_range_max でクリップ
-        ranges = np.where(np.isfinite(ranges), ranges, self._scan_range_max)
-        ranges = np.clip(ranges, self._scan_range_min, self._scan_range_max)
+        # ★ ロール: n//2 シフトで物理前方(index 0≈-π)を配列中央へ
+        #   ロール前 index 0 → ロール後 index n//2 (=540) = 物理前方
+        #   ロール前 index 540(後方) → ロール後 index 0 と 1079 (配列両端=後方)
+        shift  = n // 2
+        ranges = np.roll(ranges_raw, shift)
 
-        # 有効範囲外を 0 にマスク
-        proc = np.where(angle_mask, ranges, 0.0)
+        # 角度配列: index=center が物理前方=0、左=正、右=負
+        center = n // 2
+        angles = (np.arange(n) - center) * angle_inc
+        # angles[center]=0(前方)、angles[0]≈-π(右後方)、angles[n-1]≈+π(左後方)
 
-        # ── Step 2: 最近傍点検出 ──────────────────────
+        # ── 有効範囲マスク（前方 ±front_angle_width）────────────
+        front_mask = np.abs(angles) <= self._front_angle_width
+        proc = np.where(front_mask, ranges, 0.0)
+
+        # ── 緊急停止判定（前方 ±emg_angle_width）────────────────
+        emg_mask   = np.abs(angles) <= self._emg_angle_width
+        emg_ranges = np.where(emg_mask & (ranges > 0), ranges, np.inf)
+        front_min  = float(np.min(emg_ranges)) if np.any(emg_mask) else self._scan_range_max
+        if front_min <= self._front_stop_dist:
+            self.get_logger().warn(
+                f'★ 緊急停止: 前方{front_min:.2f}m < 停止距離{self._front_stop_dist:.2f}m')
+            self._publish_stop()
+            return
+
+        # ── Step 2: 最近傍点検出 ──────────────────────────────────
         valid_mask = proc > 0
         if not np.any(valid_mask):
             self.get_logger().warn('有効スキャン点なし')
             self._publish_stop()
             return
+        masked      = np.where(valid_mask, proc, np.inf)
+        closest_idx = int(np.argmin(masked))
 
-        masked_ranges = np.where(valid_mask, proc, np.inf)
-        closest_idx   = int(np.argmin(masked_ranges))
-
-        # ── Step 3: 安全バブル処理 ────────────────────
+        # ── Step 3: 安全バブル ────────────────────────────────────
         bubble_angle = math.atan2(self._bubble_radius, max(proc[closest_idx], 0.01))
         bubble_steps = int(bubble_angle / angle_inc)
-        lo = max(0,     closest_idx - bubble_steps)
-        hi = min(n - 1, closest_idx + bubble_steps)
-        proc[lo:hi+1] = 0.0
+        lo = max(0,     closest_idx-bubble_steps)
+        hi = min(n-1,   closest_idx+bubble_steps)
+        proc[lo:hi+1]  = 0.0
 
-        # ── Step 4: 最大ギャップ検出 ──────────────────
+        # ── Step 4: 最大ギャップ ──────────────────────────────────
         gap_start, gap_end = self._find_max_gap(proc)
         if gap_start is None:
             self.get_logger().warn('ギャップ検出失敗')
             self._publish_stop()
             return
 
-        # ── Step 5: 目標点選定（最遠点）─────────────────
-        gap_ranges = proc[gap_start:gap_end+1]
-        best_local = int(np.argmax(gap_ranges))
-        target_idx = gap_start + best_local
-        target_angle  = angles[target_idx]
-        target_dist   = proc[target_idx]
+        # ── Step 5: 目標点（ギャップ中央）──────────────────
+        best_local  = (gap_end - gap_start) // 2
+        target_idx  = gap_start + best_local
+        alpha       = angles[target_idx]   # 0=前方、正=左、負=右
+        # alphaを±max_target_angleでクリップ（境界貼り付き防止）
+        max_alpha   = self._max_target_angle
+        alpha       = float(np.clip(alpha, -max_alpha, max_alpha))
+        target_dist = proc[target_idx] if proc[target_idx] > 0 else self._scan_range_max
 
-        # ── Step 6: Pure Pursuit ステアリング計算 ───────
+        # ── Step 6: Pure Pursuit ─────────────────────────────────
         v = max(abs(self._v_current), 0.01)
-        lookahead = float(np.clip(self._k_lookahead * v,
-                                   self._lookahead_min,
-                                   self._lookahead_max))
+        lookahead = float(np.clip(
+            self._k_lookahead*v, self._lookahead_min, self._lookahead_max))
+        steer = math.atan2(2.0*self._wheelbase*math.sin(alpha), lookahead)
+        steer = float(np.clip(
+            self._steer_sign * steer, -self._max_steer, self._max_steer))
+        # EMAスムージング無効（遅延による蛇行防止のため）
 
-        alpha   = target_angle          # laser フレームでの目標点角度
-        steer   = math.atan2(2.0 * self._wheelbase * math.sin(alpha), lookahead)
-        steer   = float(np.clip(steer, -self._max_steer, self._max_steer))
+        # ── Step 7: 速度制御 ─────────────────────────────────────
+        if self._use_speed_pid:
+            error = self._speed_target - self._v_current
+            speed = max(self._pid.compute(error, dt), self._speed_min)
+        else:
+            speed = self._speed_target
 
-        # ── Step 7: 速度 PID ──────────────────────────
-        error   = self._speed_target - self._v_current
-        speed   = self._pid.compute(error, dt)
-        speed   = max(speed, self._speed_min)
-
-        # ── Publish ───────────────────────────────────
         self._publish_drive(steer, speed)
 
-        self.get_logger().debug(
-            f'target_angle={math.degrees(target_angle):.1f}° '
-            f'dist={target_dist:.2f}m '
-            f'lookahead={lookahead:.2f}m '
-            f'steer={math.degrees(steer):.1f}° '
-            f'v_cur={self._v_current:.2f} speed_cmd={speed:.2f}'
+        # ── Step 8: 可視化マーカー送信 ───────────────────────────
+        self._publish_markers(
+            angles, proc,
+            closest_idx,
+            gap_start, gap_end,
+            alpha, target_dist
         )
 
-    # ──────────────────────────────────────────────────
-    def _find_max_gap(self, proc):
-        """連続する非ゼロ要素の最長区間を返す"""
-        best_start = best_end = None
-        best_len   = 0
-        cur_start  = None
+        self.get_logger().info(
+            f'front={front_min:.2f}m '
+            f'gap=[{gap_start}:{gap_end}] '
+            f'alpha={math.degrees(alpha):.1f}deg '
+            f'lookahead={lookahead:.2f}m '
+            f'steer={math.degrees(steer):.1f}deg '
+            f'v_cur={self._v_current:.2f} '
+            f'speed={speed:.2f}'
+        )
 
-        for i, val in enumerate(proc):
-            if val > 0:
-                if cur_start is None:
-                    cur_start = i
+    def _publish_markers(self, angles, proc, closest_idx, gap_start, gap_end, alpha, target_dist):
+        """
+        Rviz2 可視化マーカーを /ftg_markers に送信する
+
+        内容:
+          id=0  CYLINDER  バブル（障害物回避禁止エリア）  orange
+          id=1  POINTS    最大ギャップ内スキャン点群      cyan
+          id=2  ARROW     目標点への経路                  yellow
+        """
+        marker_array = MarkerArray()
+        now = self.get_clock().now().to_msg()
+        LIFETIME_NS = 300_000_000  # 0.3秒で消える（古いマーカーを自動削除）
+
+        # ------------------------------------------------------------------
+        # id=0: CYLINDER バブル
+        #   最近傍点の実空間座標を中心に bubble_radius の円柱を描く
+        #   laser フレーム: x=前方, y=左
+        # ------------------------------------------------------------------
+        c_dist  = float(proc[closest_idx])
+        c_angle = float(angles[closest_idx])
+        m_bubble = Marker()
+        m_bubble.header.frame_id = 'laser'
+        m_bubble.header.stamp    = now
+        m_bubble.ns              = 'ftg'
+        m_bubble.id              = 0
+        m_bubble.type            = Marker.CYLINDER
+        m_bubble.action          = Marker.ADD
+        m_bubble.pose.position.x = -c_dist * math.cos(c_angle)
+        m_bubble.pose.position.y = -c_dist * math.sin(c_angle)
+        m_bubble.pose.position.z = 0.0
+        m_bubble.pose.orientation.w = 1.0
+        m_bubble.scale.x = self._bubble_radius * 2.0   # 直径
+        m_bubble.scale.y = self._bubble_radius * 2.0
+        m_bubble.scale.z = 0.05                         # 薄い円盤として表示
+        m_bubble.color.r = 1.0
+        m_bubble.color.g = 0.4
+        m_bubble.color.b = 0.0
+        m_bubble.color.a = 0.45   # 半透明
+        m_bubble.lifetime.nanosec = LIFETIME_NS
+        marker_array.markers.append(m_bubble)
+
+        # ------------------------------------------------------------------
+        # id=1: POINTS 最大ギャップ内スキャン点群
+        #   gap_start〜gap_end の有効点(proc>0)を cyan の点群として描く
+        # ------------------------------------------------------------------
+        m_gap = Marker()
+        m_gap.header.frame_id = 'laser'
+        m_gap.header.stamp    = now
+        m_gap.ns              = 'ftg'
+        m_gap.id              = 1
+        m_gap.type            = Marker.POINTS
+        m_gap.action          = Marker.ADD
+        m_gap.scale.x         = 0.04   # 点のサイズ [m]
+        m_gap.scale.y         = 0.04
+        m_gap.color.r         = 0.0
+        m_gap.color.g         = 1.0
+        m_gap.color.b         = 1.0
+        m_gap.color.a         = 0.9
+        m_gap.lifetime.nanosec = LIFETIME_NS
+        for i in range(gap_start, gap_end + 1):
+            if proc[i] > 0:
+                p = Point()
+                p.x = -float(proc[i]) * math.cos(float(angles[i]))
+                p.y = -float(proc[i]) * math.sin(float(angles[i]))
+                p.z = 0.0
+                m_gap.points.append(p)
+        marker_array.markers.append(m_gap)
+
+        # ------------------------------------------------------------------
+        # id=2: ARROW 目標点への経路
+        #   laser原点 → 選択された目標点 への矢印
+        #   alpha はクリップ後の角度なので実際の操舵方向と一致する
+        # ------------------------------------------------------------------
+        m_arrow = Marker()
+        m_arrow.header.frame_id = 'laser'
+        m_arrow.header.stamp    = now
+        m_arrow.ns              = 'ftg'
+        m_arrow.id              = 2
+        m_arrow.type            = Marker.ARROW
+        m_arrow.action          = Marker.ADD
+        start = Point(); start.x = 0.0; start.y = 0.0; start.z = 0.0
+        goal  = Point()
+        goal.x = -float(target_dist * math.cos(alpha))
+        goal.y = -float(target_dist * math.sin(alpha))
+        goal.z = 0.0
+        m_arrow.points = [start, goal]
+        m_arrow.scale.x = 0.02   # 矢印の軸の太さ
+        m_arrow.scale.y = 0.03    # 矢印の頭の太さ
+        m_arrow.scale.z = 0.03
+        m_arrow.color.r = 1.0
+        m_arrow.color.g = 1.0
+        m_arrow.color.b = 0.0
+        m_arrow.color.a = 1.0
+        m_arrow.lifetime.nanosec = LIFETIME_NS
+        marker_array.markers.append(m_arrow)
+
+        self._marker_pub.publish(marker_array)
+
+    def _find_max_gap(self, proc):
+        best_start=best_end=None; best_len=0; cur_start=None
+        for i,val in enumerate(proc):
+            if val>0:
+                if cur_start is None: cur_start=i
             else:
                 if cur_start is not None:
-                    length = i - cur_start
-                    if length > best_len:
-                        best_len  = length
-                        best_start = cur_start
-                        best_end   = i - 1
-                    cur_start = None
-
-        # 末尾まで続いていた場合
+                    length=i-cur_start
+                    if length>best_len:
+                        best_len=length; best_start=cur_start; best_end=i-1
+                    cur_start=None
         if cur_start is not None:
-            length = len(proc) - cur_start
-            if length > best_len:
-                best_start = cur_start
-                best_end   = len(proc) - 1
-
+            length=len(proc)-cur_start
+            if length>best_len:
+                best_start=cur_start; best_end=len(proc)-1
         return best_start, best_end
 
-    # ──────────────────────────────────────────────────
-    def _publish_drive(self, steering_angle, speed):
-        msg = AckermannDriveStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_link'
-        msg.drive.steering_angle = steering_angle
-        msg.drive.speed          = speed
+    def _publish_drive(self, steer, speed):
+        msg=AckermannDriveStamped()
+        msg.header.stamp=self.get_clock().now().to_msg()
+        msg.header.frame_id='base_link'
+        msg.drive.steering_angle=steer
+        msg.drive.speed=speed
         self._drive_pub.publish(msg)
 
     def _publish_stop(self):
@@ -269,7 +363,7 @@ class FollowTheGapNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = FollowTheGapNode()
+    node=FollowTheGapNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -278,6 +372,5 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
 
-
-if __name__ == '__main__':
+if __name__=='__main__':
     main()
