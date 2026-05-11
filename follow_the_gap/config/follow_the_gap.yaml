@@ -1,34 +1,22 @@
 follow_the_gap_node:
   ros__parameters:
-
-    # --- 車両パラメータ ---
-    wheelbase: 0.257          # ホイールベース [m]（TT-02公称値・変更可）
-
-    # --- FTG パラメータ ---
-    bubble_radius: 0.3        # 安全バブル半径 [m]
-    scan_range_min: 0.1       # 有効スキャン最小距離 [m]
-    scan_range_max: 3.5       # 有効スキャン最大距離 [m]
-    scan_angle_min: -2.35     # 有効スキャン角度範囲 最小 [rad]（±135°）
-    scan_angle_max:  2.35     # 有効スキャン角度範囲 最大 [rad]
-
-    # --- Pure Pursuit パラメータ ---
-    k_lookahead: 0.5          # lookahead = k_lookahead × v_current
-    lookahead_min: 0.3        # lookahead 下限 [m]
-    lookahead_max: 2.0        # lookahead 上限 [m]
-    max_steering_angle: 0.4   # ステアリング最大角 [rad]（約23°）
-
-    # --- 速度パラメータ ---
-    speed_target: 1.0         # 目標速度 [m/s]
-    speed_min: 0.3            # 最低速度 [m/s]（停止防止）
-
-    # --- 速度PID（ZN法 オーバーシュートなし）---
-    # チューニング手順:
-    #   1. zn_ku のみを徐々に上げながら走行
-    #   2. 速度が等振幅でハンチングし始めた値 = zn_ku
-    #   3. そのときの振動周期 [s] = zn_tu
-    #   4. ノード起動時に自動計算: Kp=0.2*Ku, Ki=0.4*Ku/Tu, Kd=0.066*Ku*Tu
-    zn_ku: 2.0                # 臨界ゲイン（チューニングで調整）
-    zn_tu: 0.5                # 臨界周期 [s]（チューニングで調整）
-    pid_output_max: 3.0       # PID出力上限（speed指令値）
-    pid_output_min: 0.0       # PID出力下限
-
+    wheelbase: 0.257
+    bubble_radius: 0.12
+    scan_range_min: 0.10       # 0.25→0.10（フレーム除去により緩和）
+    scan_range_max: 3.5
+    front_angle_width: 1.57   # ±70°→±90°（前方広く使える）
+    emergency_angle_width: 0.26
+    k_lookahead: 0.5
+    lookahead_min: 0.5
+    lookahead_max: 0.8
+    max_steering_angle: 0.4
+    max_target_angle: 0.61
+    speed_target: 0.5
+    speed_min: 0.3
+    use_speed_pid: false
+    front_stop_distance: 0.35
+    steer_sign: -1
+    zn_ku: 2.0
+    zn_tu: 0.5
+    pid_output_max: 1.0
+    pid_output_min: 0.0

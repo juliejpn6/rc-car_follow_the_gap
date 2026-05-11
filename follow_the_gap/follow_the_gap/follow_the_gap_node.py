@@ -62,7 +62,18 @@ class FollowTheGapNode(Node):
         self._load_params()
         self._init_pid()
         self._enabled=False; self._v_current=0.0; self._prev_stamp=None
-        self._steer_ema=0.0  # EMAスムージング用
+        self._steer_ema=0.0       # EMAスムージング用
+        self._gap_center_prev=-1   # ヒステリシス用：-1=未初期化
+        self._alpha_prev=0.0        # alpha急変検出用
+        self._steer_prev=0.0        # ステアリングレートリミッタ用
+        self._alpha_filtered=0.0   # デッドバンド用
+        # ── ログ制御 ──────────────────────────────────
+        self._log_last_summary     = 0.0
+        self._LOG_SUMMARY_INTERVAL = 1.0
+        self._log_prev             = {}
+        self._LOG_STEER_TH = 3.0    # ステア変化閾値 [deg]
+        self._LOG_FRONT_TH = 0.15   # 前方距離変化閾値 [m]
+        self._LOG_GAP_W_TH = 15.0   # ギャップ幅変化閾値 [deg]
 
         self._drive_pub  = self.create_publisher(AckermannDriveStamped,'drive',10)
         self._marker_pub = self.create_publisher(MarkerArray, '/ftg_markers', 10)
@@ -113,6 +124,12 @@ class FollowTheGapNode(Node):
         if self._enabled:
             self._pid.reset()
             self._steer_ema=0.0
+            self._gap_center_prev=-1
+            self._alpha_filtered=0.0
+            self._steer_prev=0.0
+            self._alpha_prev=0.0
+            self._log_prev         = {}
+            self._log_last_summary = 0.0
             self.get_logger().info('★ FTG 走行 開始')
         else:
             self._publish_stop()
@@ -172,8 +189,9 @@ class FollowTheGapNode(Node):
             self.get_logger().warn('有効スキャン点なし')
             self._publish_stop()
             return
-        masked      = np.where(valid_mask, proc, np.inf)
-        closest_idx = int(np.argmin(masked))
+        masked       = np.where(valid_mask, proc, np.inf)
+        closest_idx  = int(np.argmin(masked))
+        closest_dist = float(ranges[closest_idx])   # バブル処理前に保存
 
         # ── Step 3: 安全バブル ────────────────────────────────────
         bubble_angle = math.atan2(self._bubble_radius, max(proc[closest_idx], 0.01))
@@ -189,13 +207,65 @@ class FollowTheGapNode(Node):
             self._publish_stop()
             return
 
-        # ── Step 5: 目標点（ギャップ中央）──────────────────
-        best_local  = (gap_end - gap_start) // 2
-        target_idx  = gap_start + best_local
-        alpha       = angles[target_idx]   # 0=前方、正=左、負=右
+        # ── Step 5: 目標点選定（2モード制御）─────────────────
+        # コーナーモード中は front>1.8m になって初めて直線モードへ
+        prev_corner = getattr(self, '_prev_was_corner', False)
+        if prev_corner:
+            is_straight = front_min > 1.8   # コーナー中: 1.8m超えで直線へ
+        else:
+            is_straight = front_min > 1.5   # 直線中: 1.5m超えで直線維持
+        self._prev_was_corner = not is_straight
+
+        if is_straight:
+            # ── 直線モード: 左右壁距離差でステアリング ──
+            if prev_corner:
+                self._wall_diff_hist = [0.0, 0.0, 0.0]
+            left_idx  = int(np.clip(center + int(math.radians(45)/angle_inc), 0, n-1))
+            right_idx = int(np.clip(center - int(math.radians(45)/angle_inc), 0, n-1))
+            d_left  = float(ranges[left_idx])  if ranges[left_idx]  > 0.1 else self._scan_range_max
+            d_right = float(ranges[right_idx]) if ranges[right_idx] > 0.1 else self._scan_range_max
+            wall_diff = d_left - d_right
+            if not hasattr(self, '_wall_diff_hist'):
+                self._wall_diff_hist = [0.0, 0.0, 0.0]
+            self._wall_diff_hist.pop(0)
+            self._wall_diff_hist.append(wall_diff)
+            wall_diff_avg = sum(self._wall_diff_hist) / len(self._wall_diff_hist)
+            alpha     = float(np.clip(math.radians(wall_diff_avg * 10.0),
+                                      -math.radians(10), math.radians(10)))
+            target_dist = front_min
+            self._gap_center_prev = gap_start + (gap_end - gap_start) // 2
+            target_idx  = int(np.clip(int(self._gap_center_prev), 0, n-1))
+        else:
+            # ── コーナーモード: ギャップ中央 + レートリミッタ ──
+            gap_center_now = gap_start + (gap_end - gap_start) // 2
+            if front_min < 0.6:
+                max_rate = 180
+            elif front_min < 0.8:
+                max_rate = 180   # 緊急: 制限なし
+            elif front_min < 1.2:
+                max_rate = 120   # コーナー深部: 速く追従
+            else:
+                max_rate = 90    # コーナー手前
+            # コーナーモード: レートリミッタなしで直接追従
+            self._gap_center_prev = gap_center_now
+            target_idx  = int(np.clip(int(self._gap_center_prev), 0, n-1))
+            alpha       = angles[target_idx]
+            target_dist = proc[target_idx] if proc[target_idx] > 0 else self._scan_range_max
         # alphaを±max_target_angleでクリップ（境界貼り付き防止）
         max_alpha   = self._max_target_angle
         alpha       = float(np.clip(alpha, -max_alpha, max_alpha))
+
+        # ── 急激な符号逆転を検出して無視（直線モード時のみ）──────
+        if is_straight:
+            alpha_change = abs(alpha - self._alpha_prev)
+            alpha_sign_flip = (alpha * self._alpha_prev < 0)
+            if alpha_sign_flip and alpha_change > math.radians(15.0):
+                alpha = self._alpha_prev
+        self._alpha_prev = alpha
+
+        # ── デッドバンド: 直線モード時のみ ±5°以内は直進とみなす ──
+        if is_straight and abs(alpha) < math.radians(5.0):
+            alpha = 0.0
         target_dist = proc[target_idx] if proc[target_idx] > 0 else self._scan_range_max
 
         # ── Step 6: Pure Pursuit ─────────────────────────────────
@@ -214,6 +284,34 @@ class FollowTheGapNode(Node):
         else:
             speed = self._speed_target
 
+        # ── ステアリング出力レートリミッタ ─────────────────────
+        # 直線: 3°/frame でゆっくり戻す
+        # コーナー手前: 10°/frame で素早く追従
+        if front_min > 1.2:
+            steer_max_rate = math.radians(3.0)   # 直線: ゆっくり
+        elif front_min > 0.8:
+            steer_max_rate = math.radians(8.0)   # コーナー手前: やや速く
+        else:
+            steer_max_rate = math.radians(20.0)  # 緊急: 制限なし
+        steer_diff = steer - self._steer_prev
+        if abs(steer_diff) > steer_max_rate:
+            steer = self._steer_prev + steer_max_rate * (1 if steer_diff > 0 else -1)
+        self._steer_prev = steer
+
+        # ── ステアリング出力レートリミッタ ─────────────────────
+        # 目標ステア角が大きい → コーナー → 素早く追従
+        # 目標ステア角が小さい → 直線微修正 → ゆっくり
+        steer_abs = abs(steer)
+        if steer_abs > math.radians(15.0):
+            steer_max_rate = math.radians(12.0)  # 大きな舵角: 速く追従
+        elif steer_abs > math.radians(8.0):
+            steer_max_rate = math.radians(6.0)   # 中程度
+        else:
+            steer_max_rate = math.radians(3.0)   # 小さい舵角: ゆっくり戻す
+        steer_diff = steer - self._steer_prev
+        if abs(steer_diff) > steer_max_rate:
+            steer = self._steer_prev + steer_max_rate * (1 if steer_diff > 0 else -1)
+        self._steer_prev = steer
         self._publish_drive(steer, speed)
 
         # ── Step 8: 可視化マーカー送信 ───────────────────────────
@@ -224,15 +322,27 @@ class FollowTheGapNode(Node):
             alpha, target_dist
         )
 
-        self.get_logger().info(
-            f'front={front_min:.2f}m '
-            f'gap=[{gap_start}:{gap_end}] '
-            f'alpha={math.degrees(alpha):.1f}deg '
-            f'lookahead={lookahead:.2f}m '
-            f'steer={math.degrees(steer):.1f}deg '
-            f'v_cur={self._v_current:.2f} '
-            f'speed={speed:.2f}'
+        # ── ログ出力（変化検知 + 定期サマリー） ──────────
+        steer_deg = math.degrees(steer)
+        alpha_deg = math.degrees(alpha)
+        gap_w_deg = math.degrees((gap_end - gap_start + 1) * angle_inc)
+        log_line = (
+            f'front={front_min:.2f}m closest={closest_dist:.2f}m '
+            f'gap_w={gap_w_deg:.0f}deg alpha={alpha_deg:.1f}deg '
+            f'steer={steer_deg:.1f}deg v={self._v_current:.2f}m/s spd={speed:.2f}'
         )
+        prev = self._log_prev
+        changed = (
+            abs(steer_deg - prev.get('steer', steer_deg + 999)) > self._LOG_STEER_TH or
+            abs(front_min - prev.get('front', front_min + 999)) > self._LOG_FRONT_TH or
+            abs(gap_w_deg - prev.get('gap_w', gap_w_deg + 999)) > self._LOG_GAP_W_TH
+        )
+        if changed:
+            self.get_logger().info(f'[CHANGE]  {log_line}')
+            self._log_prev = {'steer': steer_deg, 'front': front_min, 'gap_w': gap_w_deg}
+        if now - self._log_last_summary >= self._LOG_SUMMARY_INTERVAL:
+            self.get_logger().info(f'[SUMMARY] {log_line}')
+            self._log_last_summary = now
 
     def _publish_markers(self, angles, proc, closest_idx, gap_start, gap_end, alpha, target_dist):
         """
