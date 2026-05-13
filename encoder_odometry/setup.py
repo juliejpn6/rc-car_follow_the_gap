@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'encoder_odom_node = encoder_odometry.encoder_odom_node:main',
+            'ackermann_odom_publisher = encoder_odometry.ackermann_odom_publisher:main',
         ],
     },
 )

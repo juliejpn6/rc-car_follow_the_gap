@@ -96,7 +96,7 @@ def generate_launch_description():
         }]
     )
 
-    # --- Encoder Odometry ---
+    # --- Encoder Odometry (直線距離のみ → /odom_raw に配信) ---
     encoder_odom_node = Node(
         package='encoder_odometry',
         executable='encoder_odom_node',
@@ -109,10 +109,28 @@ def generate_launch_description():
             'wheel_diameter': 0.066,
             'wheelbase': 0.257,
             'publish_rate': 30.0,
-            'publish_tf': True,
+            'publish_tf': False,   # TF配信は ackermann_odom_publisher に委譲
             'odom_frame': 'odom',
             'base_frame': 'base_link',
-        }]
+        }],
+        remappings=[('/odom', '/odom_raw')],  # 直線odomは /odom_raw へ
+    )
+
+    # --- Ackermann Odometry (Ackermann補正済み /odom + TF 配信) ---
+    ackermann_odom_node = Node(
+        package='encoder_odometry',
+        executable='ackermann_odom_publisher',
+        name='ackermann_odom_publisher',
+        output='screen',
+        parameters=[{
+            'wheelbase':      0.257,
+            'odom_frame':     'odom',
+            'base_frame':     'base_link',
+            'odom_raw_topic': '/odom_raw',
+            'cmd_topic':      '/ackermann_cmd',
+            'odom_out_topic': '/odom',
+            'publish_tf':     True,  # TF: odom -> base_link を担当
+        }],
     )
 
     # =========================================================================
@@ -201,6 +219,7 @@ def generate_launch_description():
     # Sensing
     ld.add_action(lidar_node)
     ld.add_action(encoder_odom_node)
+    ld.add_action(ackermann_odom_node)
 
     # Control
     ld.add_action(pwm_driver_node)
