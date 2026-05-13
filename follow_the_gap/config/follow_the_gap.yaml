@@ -2,21 +2,25 @@ follow_the_gap_node:
   ros__parameters:
     wheelbase: 0.257
     bubble_radius: 0.12
-    scan_range_min: 0.10       # 0.25→0.10（フレーム除去により緩和）
+    scan_range_min: 0.10
     scan_range_max: 3.5
-    front_angle_width: 1.57   # ±70°→±90°（前方広く使える）
+    front_angle_width: 1.57
     emergency_angle_width: 0.26
     k_lookahead: 0.5
     lookahead_min: 0.5
     lookahead_max: 0.8
     max_steering_angle: 0.4
     max_target_angle: 0.61
-    speed_target: 0.5
-    speed_min: 0.3
-    use_speed_pid: false
-    front_stop_distance: 0.35
+    speed_target: 0.8
+    speed_min: 0.45
+    use_speed_pid: true
+    front_stop_distance: 0.28
     steer_sign: -1
     zn_ku: 2.0
     zn_tu: 0.5
     pid_output_max: 1.0
     pid_output_min: 0.0
+    # 自己干渉マスク（ロール後角度[deg]、ペアで指定）
+    # -48〜-38°: 右斜め前のタイヤ/フレーム
+    # +16〜+20°: 左斜め前のフレーム
+    self_mask_ranges: [-48.0, -38.0, 16.0, 20.0]
