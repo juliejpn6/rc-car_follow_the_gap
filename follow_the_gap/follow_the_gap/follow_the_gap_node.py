@@ -47,6 +47,8 @@ class FollowTheGapNode(Node):
         self.declare_parameter('front_angle_width',     1.57)
         self.declare_parameter('emergency_angle_width', 0.26)
         self.declare_parameter('k_lookahead',           0.5)
+        self.declare_parameter('k_lookahead_corner',    0.35)  # コーナー用（小さい→鋭く反応）
+        self.declare_parameter('corner_threshold_deg',  12.0)  # コーナー判定閾値[deg]
         self.declare_parameter('lookahead_min',         0.5)
         self.declare_parameter('lookahead_max',         0.8)
         self.declare_parameter('max_steering_angle',    0.4)
@@ -102,9 +104,11 @@ class FollowTheGapNode(Node):
         self._scan_range_max   = self.get_parameter('scan_range_max').value
         self._front_angle_width= self.get_parameter('front_angle_width').value
         self._emg_angle_width  = self.get_parameter('emergency_angle_width').value
-        self._k_lookahead      = self.get_parameter('k_lookahead').value
-        self._lookahead_min    = self.get_parameter('lookahead_min').value
-        self._lookahead_max    = self.get_parameter('lookahead_max').value
+        self._k_lookahead         = self.get_parameter('k_lookahead').value
+        self._k_lookahead_corner  = self.get_parameter('k_lookahead_corner').value
+        self._corner_threshold    = math.radians(self.get_parameter('corner_threshold_deg').value)
+        self._lookahead_min       = self.get_parameter('lookahead_min').value
+        self._lookahead_max       = self.get_parameter('lookahead_max').value
         self._max_steer        = self.get_parameter('max_steering_angle').value
         self._speed_target     = self.get_parameter('speed_target').value
         self._speed_min        = self.get_parameter('speed_min').value
@@ -280,8 +284,9 @@ class FollowTheGapNode(Node):
 
         # ── Step 6: Pure Pursuit ─────────────────────────────────
         v = max(abs(self._v_current), 0.01)
-        lookahead = float(np.clip(
-            self._k_lookahead*v, self._lookahead_min, self._lookahead_max))
+        # 動的lookahead: コーナー（alpha大）は短く・直線は長く
+        k = self._k_lookahead_corner if abs(alpha) > self._corner_threshold else self._k_lookahead
+        lookahead = float(np.clip(k * v, self._lookahead_min, self._lookahead_max))
         steer = math.atan2(2.0*self._wheelbase*math.sin(alpha), lookahead)
         steer = float(np.clip(
             self._steer_sign * steer, -self._max_steer, self._max_steer))
