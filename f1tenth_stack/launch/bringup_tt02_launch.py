@@ -106,7 +106,7 @@ def generate_launch_description():
             'encoder_a_pin': 22,
             'encoder_b_pin': 27,
             'pulses_per_rev': 36,
-            'wheel_diameter': 0.066,
+            'wheel_diameter': 0.0638,
             'wheelbase': 0.257,
             'publish_rate': 30.0,
             'publish_tf': False,   # TF配信は ackermann_odom_publisher に委譲
